@@ -25,14 +25,16 @@
 - IPSW pieces via `tools/remotezip.py` into `/home/olaffx/Pobrane/ios-miatoll-work/ipsw/`: OS/SystemOS/AppOS DMGs + `Firmware/` (d22ap im4p) + BuildManifest.plist.
 - `d22ap.adt` extracted from the im4p (blacktop `ipsw img4 im4p extract`) to `research/ipsw-x/d22ap.adt` — the `/product` identity node mkadt copies.
 - Kernel CI already run on the fork (run `39170804069`, success); `kernel.development.sweet` downloaded to `xnu/out/`.
-- `mkbootimg` installed (apt), `libfuse3-dev` still needed for apfs-fuse (mkiosroot dependency), `dtc` installed.
+- `mkbootimg` installed (apt), `dtc` installed. **apfs-fuse built + installed to `/usr/local/bin/apfs-fuse`** (needed for mkiosroot; `git clone --depth 1 https://github.com/sgan81/apfs-fuse`, `git submodule update --init --recursive` for `3rdparty/lzfse`, `cmake .. -DCMAKE_BUILD_TYPE=Release && make -j`, `sudo install -m 755 apfs-fuse /usr/local/bin/`; `libfuse3-dev` installed via apt). Verified it runs (`apfs-fuse --help`).
+
+**Disk reality (this machine, NOT the other one):** single NVMe, `/` **19G free** (not the 26G the earlier estimate assumed — that figure was from the other host). The three IPSW DMGs already on disk total ~7.5 GB. mkiosroot writes a sparse 16G HFS+ image that grows to the *decompressed* OS+cryptex size (~11–12 GB for iPhone X 16.7); `img2simg` then makes a simg of similar size, and **both the plain img and the simg exist simultaneously during img2simg**, so peak disk = plain + simg (~24 GB) unless the DMGs are deleted first. Feasible sequence inside 19G: mkiosroot (plain ~12 GB; DMGs already counted in used) -> `rm` the DMGs (free ~7.5 GB) -> img2simg (simg ~12 GB; plain+simg ~24 GB < 19+7.5 budget, ~2.5 GB margin) -> `rm` the plain img. Tight; a mid-build stall or larger-than-expected data exhausts disk. **The image cannot be tested without the device (not connected yet)** — so this is the first step that spends scarce disk on an untestable-now artifact. Check with the user before running it.
 
 **Next concrete steps (unchanged intent, miatoll):**
-1. Finish device-profile edits (this UPDATE) -> commit to `olaffx/ios-miatoll`.
-2. `sudo apt-get install -y libfuse3-dev` then build apfs-fuse -> install `/usr/local/bin`.
-3. Build the 16 GiB root image: `tools/mkiosroot.sh` with the three DMGs -> fsck/mount -> `sweet-root-tweaks.py` -> `img2simg` (disk is tight ~26 GB free: sequence dmgs -> mkiosroot -> delete dmgs -> img2simg -> delete plain img).
+1. Finish device-profile edits (this UPDATE) -> commit to `olaffx/ios-miatoll`. **DONE (commit `74650de`, branch `miatoll`, not pushed).**
+2. `sudo apt-get install -y libfuse3-dev` then build apfs-fuse -> install `/usr/local/bin`. **DONE.**
+3. Build the 16 GiB root image: `tools/mkiosroot.sh` with the three DMGs -> fsck/mount -> `sweet-root-tweaks.py` -> `img2simg` (disk is tight — see the sequence above; confirm with the user first given the 19G free / ~2.5 GB margin).
 4. First-boot diagnostics on the device: `DEVICE=miatoll ./build.sh payload.bin`, boot the image, read the `MEM0..` lines from the live FDT, confirm/override the RAM window, then `cpus=1` -> `cpus=6`, `sweettouch=0` until the Synaptics TCM driver is written.
-5. Update README miatoll section + finish remaining todos (touch driver plan, artifacts).
+5. Update README miatoll section (**DONE**) + finish remaining todos (touch driver plan, artifacts).
 
 ### >>> UPDATE 2026-10-18 (read the 10-19 miatoll section above first; sweet-specific) <<<
 
