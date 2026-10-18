@@ -55,9 +55,11 @@ DEVICES = {
         compat=('D22AP', 'iPhone10,3', 'xiaomi,sweet', 'xiaomi,miatoll',
                 'qcom,sm7125', 'AppleARM'),
         ecid=0x4d4941544f4c4c01,  # 'MIATOLL' + 1, synthetic
-        # Same layout as sweet assumed (stock DTB memory node is zeroed);
-        # the shim's MEM0.. diagnostic lines confirm or override via --phys/--mem.
-        high_phys=0x100000000, high_mem=0xfcc00000,
+        # Live FDT (read at 00:40 via recovery adb) has 3 banks: 2G @0x80000000,
+        # 4G @0x100000000, 1G @0x200000000. /chosen carries one dram window, so
+        # point it at the dominant 4G bank. The shim prints all 3 as MEM0.. at
+        # boot; --phys/--mem override if a board's layout differs.
+        high_phys=0x100000000, high_mem=0x100000000,
     ),
 }
 
@@ -98,10 +100,9 @@ def node(name, props=(), children=()):
 
 def build(seed=None, qemu=False, highmem=False, device='sweet', phys=None, mem=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
-    device: key of DEVICES (sweet or miatoll). phys/mem: override the RAM
-    window of the chosen layout (hex); use after reading the shim's MEM0..
-    diagnostic lines for a board whose live FDT disagrees with the assumed
-    layout."""
+    device: key of DEVICES (sweet or miatoll). phys/mem: override the single
+    highmem window (hex); read the shim's MEM0.. lines at boot to see the live
+    FDT banks, then point the window at the dominant bank if it differs."""
     dev = DEVICES[device]
     if highmem:
         phys_base, mem_size = dev['high_phys'], dev['high_mem']

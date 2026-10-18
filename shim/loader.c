@@ -84,8 +84,9 @@ const char *loader_boot(uintptr_t dtb)
 	 * shipped DTB has /memory zeroed; a 0 here means ABL did not fill it).
 	 * miatoll's stock DTB memory node is also zeroed, so trust these lines
 	 * over any assumed layout. */
-	uint64_t banks[8];
-	int nb = fdt_memory_banks(dtb, banks, 4);
+	/* banks[] holds (base,size) pairs; the buffer holds 8 pairs. */
+	uint64_t banks[16];
+	int nb = fdt_memory_banks(dtb, banks, 8);
 	if (nb > 0) {
 		for (int i = 0; i < nb; i++) {
 			char lb[5] = "MEM0";
