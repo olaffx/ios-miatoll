@@ -1,5 +1,14 @@
 #!/bin/bash
-# Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
+# Build the shim and wrap it in a boot.img v2 that mirrors the stock header
+# of the target device.
+#
+#   DEVICE=sweet    (default) DTB ../dtb/boot_unpacked/dtb, os 17.0.0/2035-06
+#   DEVICE=miatoll  Redmi Note 9 Pro: DTB ../dtb/miatoll_unpacked/dtb,
+#                   os_version/patch_level mirror the stock miatoll header
+#                   (Android 15.0.0 / 2026-09, decoded from 0x1e0001a9).
+# The miatoll header's segment offsets (base 0, kernel 0x8000, ramdisk
+# 0x1000000, tags 0x100, dtb 0x1f00000, pagesize 4096) are identical to
+# sweet's, so only the DTB path and the os_* fields differ.
 set -euo pipefail
 cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
@@ -17,7 +26,8 @@ $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -W
 	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+end=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')
+size=$((16#$end))
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
@@ -26,10 +36,30 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
+DEVICE=${DEVICE:-sweet}
+case "$DEVICE" in
+sweet)
+	DTB=../dtb/boot_unpacked/dtb
+	OS_VERSION=17.0.0
+	OS_PATCH_LEVEL=2035-06
+	;;
+miatoll)
+	DTB=../dtb/miatoll_unpacked/dtb
+	# stock miatoll os_version 0x1e0001a9 = Android 15.0.0, patch 2026-09
+	OS_VERSION=15.0.0
+	OS_PATCH_LEVEL=2026-09
+	;;
+*)
+	echo "error: unknown DEVICE=$DEVICE (want sweet or miatoll)" >&2
+	exit 1
+	;;
+esac
+[ -f "$DTB" ] || { echo "error: DTB $DTB missing" >&2; exit 1; }
+echo "DEVICE=$DEVICE DTB=$DTB os=$OS_VERSION/$OS_PATCH_LEVEL"
 mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
+	--dtb "$DTB" --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
 	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
+	--os_version "$OS_VERSION" --os_patch_level "$OS_PATCH_LEVEL" \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test

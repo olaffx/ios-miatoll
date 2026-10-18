@@ -80,6 +80,26 @@ const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
+	/* Bring-up diagnostic: print the live RAM banks ABL handed us (the
+	 * shipped DTB has /memory zeroed; a 0 here means ABL did not fill it).
+	 * miatoll's stock DTB memory node is also zeroed, so trust these lines
+	 * over any assumed layout. */
+	uint64_t banks[8];
+	int nb = fdt_memory_banks(dtb, banks, 4);
+	if (nb > 0) {
+		for (int i = 0; i < nb; i++) {
+			char lb[5] = "MEM0";
+			lb[3] = (char)('0' + i);
+			con_hex2(lb, "base=", (uint32_t)banks[2 * i],
+				 "size=", (uint32_t)banks[2 * i + 1]);
+			if ((banks[2 * i] >> 32) || (banks[2 * i + 1] >> 32))
+				con_hex2(lb, "base_hi=", (uint32_t)(banks[2 * i] >> 32),
+					 "size_hi=", (uint32_t)(banks[2 * i + 1] >> 32));
+		}
+	} else {
+		con_str("MEM", "no /memory banks in live FDT");
+	}
+
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";

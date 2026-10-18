@@ -2,28 +2,36 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT.
+
+Usage:  mkadt.py OUT.adt [--device sweet|miatoll] [--dump] [--qemu] [--highmem]
+                      [--phys 0xBASE] [--mem 0xSIZE]
+
+Device profiles: sweet = Redmi Note 10 Pro (SM7150), miatoll = Redmi Note 9
+Pro (SM7125). Both are the same Atoll platform and the stock miatoll boot.img
+DTB has GIC (0x17a00000), UFS (0x1d84000), QUP/GENI, SPMI (0xc440000), GCC,
+PSHOLD and the ABL splash framebuffer (0x9c000000) at exactly the sweet
+addresses, so only the identity strings, the synthetic ECID and the RAM
+window are per-device. The shipped DTB's memory node is zeroed (ABL fills it
+at load); --phys/--mem override the upper-bank window when the live FDT says
+something else (the shim prints it as MEM0.. lines on a diagnostic boot).
 """
 import hashlib, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
+# Kernel-managed RAM (non-highmem, qemu/testing): above every Qualcomm XPU
+# carve-out (see NOTES.md). The phone boots with --highmem; the per-device
+# upper-bank windows are in DEVICES below.
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
-# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
-# carve-out is in the low bank and the dynamic pools are limited below 4G.
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
-SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
@@ -32,6 +40,26 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+
+# Per-device identity. 'xiaomi,sweet' must stay at its current compatible
+# index for SweetPlatformExpert (0016 IONameMatch); miatoll keeps it after
+# its own name and only overrides the SoC string.
+DEVICES = {
+    'sweet': dict(
+        compat=('D22AP', 'iPhone10,3', 'xiaomi,sweet', 'qcom,sm7150', 'AppleARM'),
+        ecid=0x5357454554000001,  # 'SWEET' + 1, synthetic
+        # 6 GiB: low 2G @0x80000000 + upper bank (live FDT memory node)
+        high_phys=0x100000000, high_mem=0xfcc00000,
+    ),
+    'miatoll': dict(
+        compat=('D22AP', 'iPhone10,3', 'xiaomi,sweet', 'xiaomi,miatoll',
+                'qcom,sm7125', 'AppleARM'),
+        ecid=0x4d4941544f4c4c01,  # 'MIATOLL' + 1, synthetic
+        # Same layout as sweet assumed (stock DTB memory node is zeroed);
+        # the shim's MEM0.. diagnostic lines confirm or override via --phys/--mem.
+        high_phys=0x100000000, high_mem=0xfcc00000,
+    ),
+}
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -68,9 +96,21 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+def build(seed=None, qemu=False, highmem=False, device='sweet', phys=None, mem=None):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    device: key of DEVICES (sweet or miatoll). phys/mem: override the RAM
+    window of the chosen layout (hex); use after reading the shim's MEM0..
+    diagnostic lines for a board whose live FDT disagrees with the assumed
+    layout."""
+    dev = DEVICES[device]
+    if highmem:
+        phys_base, mem_size = dev['high_phys'], dev['high_mem']
+    else:
+        phys_base, mem_size = PHYS_BASE, MEM_SIZE
+    if phys is not None:
+        phys_base = phys
+    if mem is not None:
+        mem_size = mem
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -101,7 +141,7 @@ def build(seed=None, qemu=False, highmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', dev['ecid'])),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -214,10 +254,11 @@ def build(seed=None, qemu=False, highmem=False):
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching;
+    # miatoll adds its own name after it (see DEVICES).
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', b''.join(cstr(s) for s in dev['compat'])),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -228,9 +269,32 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    argv = sys.argv[1:]
+    out = argv.pop(0)
+
+    def flag_value(name):
+        if name not in argv:
+            return None
+        i = argv.index(name)
+        argv.pop(i)
+        return argv.pop(i)
+
+    device = flag_value('--device') or 'sweet'
+    if device not in DEVICES:
+        raise SystemExit(f'unknown --device {device!r}, want one of {sorted(DEVICES)}')
+    qemu = '--qemu' in argv
+    highmem = '--highmem' in argv
+    dump = '--dump' in argv
+    phys_s, mem_s = flag_value('--phys'), flag_value('--mem')
+    phys = int(phys_s, 0) if phys_s else None
+    mem = int(mem_s, 0) if mem_s else None
+    if (phys_s or mem_s) and not highmem:
+        print('warning: --phys/--mem only apply with --highmem', file=sys.stderr)
+    root = build(qemu=qemu, highmem=highmem, device=device, phys=phys, mem=mem)
     blob = adt.serialize(root)
-    open(sys.argv[1], 'wb').write(blob)
-    if '--dump' in sys.argv:
+    open(out, 'wb').write(blob)
+    if dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    win = (phys, mem) if phys is not None or mem is not None else None
+    print(f'{out}: {len(blob)} bytes (device={device} highmem={highmem} override={win})',
+          file=sys.stderr)

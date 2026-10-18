@@ -2,7 +2,39 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
+### >>> UPDATE 2026-10-19 (read first, then the 10-18 handoff below) <<<
+
+**Miatoll cross-port (Redmi Note 9 Pro, codename `joyeuse`, SM7125 "Atoll").** Goal: same iOS 16.7.16 root on the miatoll family. Working clone is a full-history fork of this repo under the user's account (`olaffx/ios-miatoll`, origin = that fork); work happens there. Device not connected yet — preparing code/artifacts first.
+
+**Hardware finding: miatoll is the same Atoll platform as sweet.** Stock miatoll DTB has GIC `0x17a00000`/GICR `0x17a60000`, UFS `0x1d84000`, DWC3 `0xa600000`, SPMI `0xc440000`/obsrvr `0xe600000`, IMEM `0x146aa000` (restart_reason `0x146aa65c`), PSHOLD `0xc264000`, GCC `0x100000`, TLMM `0x3400000`, timebase 19.2 MHz, ABL splash framebuffer `0x9c000000` size `0x1700000` (1080x2400) — **all identical to sweet.** So `mkadt.py` MMIO and the shim's hardcoded addresses (FB/GIC/UFS/IMEM/PSHOLD) work unmodified. CPUs: 8 cores, reg `core<<8` MPIDR scheme identical (A55x6 + A76x2, 2.3/1.8 GHz). Vol-up = PM6150L@SID4 GPIO2 (`0xc110`) on SPMI — **keys driver (patch 0060) works as-is.**
+
+**What differs on miatoll (new work needed):**
+- **Touch:** sweet was Goodix GT9896 @0x5d on GENI SE7; miatoll is **Synaptics TCM** (`synaptics,tcm-i2c`) @ I2C `0x20`, IRQ tlmm GPIO9, reset GPIO8. The GENI I2C bus (SE7 @0xa84000) is the same, but the protocol/IC is different — **new touch driver needed later.** Until then boot with `sweettouch=0`.
+- **Panel:** LCD `ft8756` (Huaxing) or `nt36675` (Tianma), video mode — not driven by the port (ABL splash framebuffer used, same as sweet).
+- **Identity strings:** device tree compat adds `xiaomi,miatoll` + `qcom,sm7125`; `hw.model`/`hw.target` stay D22AP (iPhone X userland). Synthetic ECID distinct from sweet.
+- **RAM layout:** stock DTB memory node is zeroed (ABL fills at runtime). Assume sweet's layout (`<0x80000000 2G>` + `<0x100000000 0xfcc00000>`, ~6 GB) until the shim's new `MEM0..` diagnostic lines (printed from the *live* FDT at boot) confirm; override with `mkadt.py --phys/--mem` if it disagrees.
+
+**Code changes this session (in `olaffx/ios-miatoll`, branch `miatoll`):**
+- `tools/mkadt.py`: new `DEVICES` profile dict; `--device {sweet,miatoll}` selects compat strings (miatoll keeps `xiaomi,sweet` at its index for SweetPlatformExpert 0016 IONameMatch, adds `xiaomi,miatoll`+`qcom,sm7125`), synthetic ECID, and per-device `--highmem` RAM window. `--phys 0xBASE --mem 0xSIZE` override the window (hex). `--device miatoll --highmem` emits `out/miatoll.adt` (12604 B).
+- `shim/fdt.c`+`fdt.h`: new `fdt_memory_banks()` — walks the live FDT `/memory` node `reg` property (honours root `#address-cells`/`#size-cells`, 2/2 here), returns base/size pairs. The shipped DTB node is zeroed, so a non-empty result = ABL's real layout.
+- `shim/loader.c`: prints each live bank as `MEM0..` (`base=`/`size=` + `_hi` when the 64-bit halves are non-zero) at the top of `loader_boot`, before the initrd check — so even the diagnostics-only boot shows the RAM banks. Stack-built label (`char lb[5]="MEM0"`) to avoid ABS64 relocations (a ternary of string literals emitted them and broke the freestanding no-ABS64 check).
+- `shim/build.sh`: `DEVICE=sweet|miatoll` env (default sweet). sweet keeps DTB `../dtb/boot_unpacked/dtb` + os 17.0.0/2035-06; miatoll uses DTB `../dtb/miatoll_unpacked/dtb` + os_version/patch_level mirroring the stock miatoll header (decoded `0x1e0001a9` = **Android 15.0.0 / 2026-09**; verified the rebuilt `shim-boot.img` os_version matches stock exactly). Header segment offsets (base 0, kernel 0x8000, ramdisk 0x1000000, tags 0x100, dtb 0x1f00000, pagesize 4096) are identical to sweet, so only the DTB path + os_* differ. Also fixed the `_end` size extraction to portable `$((16#hex))` (the previous gawk `strtonum` is absent on mawk hosts). `DEVICE=miatoll ./build.sh` builds clean (Image 184320 B, shim-boot.img 524288 B, no warnings); the sweet DTB path is missing locally (only miatoll's was unpacked) so the default sweet build is exercised on the original machine.
+
+**Artifacts prepared (local, kept out of git):**
+- Stock miatoll `boot.img` unpacked to `dtb/miatoll_unpacked/` (dtb 330 KB, header v2). `dtbo.img` overlays extracted; dtbo-03 = JOYEUSE (board-id `0x50022`): Synaptics TCM @0x20, vol_up PM6150L GPIO2, ft8756/nt36675 panels.
+- IPSW pieces via `tools/remotezip.py` into `/home/olaffx/Pobrane/ios-miatoll-work/ipsw/`: OS/SystemOS/AppOS DMGs + `Firmware/` (d22ap im4p) + BuildManifest.plist.
+- `d22ap.adt` extracted from the im4p (blacktop `ipsw img4 im4p extract`) to `research/ipsw-x/d22ap.adt` — the `/product` identity node mkadt copies.
+- Kernel CI already run on the fork (run `39170804069`, success); `kernel.development.sweet` downloaded to `xnu/out/`.
+- `mkbootimg` installed (apt), `libfuse3-dev` still needed for apfs-fuse (mkiosroot dependency), `dtc` installed.
+
+**Next concrete steps (unchanged intent, miatoll):**
+1. Finish device-profile edits (this UPDATE) -> commit to `olaffx/ios-miatoll`.
+2. `sudo apt-get install -y libfuse3-dev` then build apfs-fuse -> install `/usr/local/bin`.
+3. Build the 16 GiB root image: `tools/mkiosroot.sh` with the three DMGs -> fsck/mount -> `sweet-root-tweaks.py` -> `img2simg` (disk is tight ~26 GB free: sequence dmgs -> mkiosroot -> delete dmgs -> img2simg -> delete plain img).
+4. First-boot diagnostics on the device: `DEVICE=miatoll ./build.sh payload.bin`, boot the image, read the `MEM0..` lines from the live FDT, confirm/override the RAM window, then `cpus=1` -> `cpus=6`, `sweettouch=0` until the Synaptics TCM driver is written.
+5. Update README miatoll section + finish remaining todos (touch driver plan, artifacts).
+
+### >>> UPDATE 2026-10-18 (read the 10-19 miatoll section above first; sweet-specific) <<<
 
 **STATE at end of 2026-10-18 (evening):**
 - On the phone: userdata = **image v15** (`/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v15.img/.simg`; = v14 + `/private/var/preferences/SystemConfiguration/preferences.plist` with one network service "USB Ethernet": Interface DeviceName ue0 Type Ethernet, IPv4 Manual 192.168.7.2/24 router 192.168.7.1, DNS 1.1.1.1 8.8.8.8, set "Automatic" as CurrentSet). Fallback image v14 (v12/v13 deleted).

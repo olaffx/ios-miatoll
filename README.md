@@ -8,6 +8,17 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
 
+## Miatoll port (Redmi Note 9 Pro)
+
+A cross-port to the **miatoll** family (Redmi Note 9 Pro, codename `joyeuse`, Qualcomm SM7125 / Snapdragon 720G "Atoll") is in progress. miatoll is the **same Atoll platform** as sweet: GIC, UFS, DWC3, SPMI, IMEM, PSHOLD, GCC, TLMM and the ABL splash framebuffer (`0x9c000000`, 1080×2400) are at identical addresses, so the shim and most of the kernel work unmodified. The differences are handled by the device profile:
+
+- `tools/mkadt.py --device miatoll` — identity strings (`xiaomi,miatoll`, `qcom,sm7125`) and a distinct synthetic ECID; `--phys/--mem` override the RAM window once the live FDT is read (stock DTB has `/memory` zeroed; the shim prints the real banks as `MEM0..` lines at boot).
+- `shim/build.sh` with `DEVICE=miatoll` — uses the miatoll stock DTB (`dtb/miatoll_unpacked/dtb`) and mirrors its boot header (`os_version` Android 15.0.0 / 2026-09). Segment offsets are identical to sweet.
+- **Touch differs:** miatoll uses a **Synaptics TCM** controller (`synaptics,tcm-i2c`, I²C `0x20`) instead of sweet's Goodix GT9896. A new driver is needed; until then boot with `sweettouch=0` (the volume/power keys — same PM6150/PM6150L SPMI/GPIO wiring — work as-is).
+- Panel is `ft8756` or `nt36675` (video mode); not driven by the port (ABL splash framebuffer is used).
+
+`DEVICE=miatoll ./shim/build.sh` builds the miatoll boot image; everything else in this README is unchanged.
+
 ## What works
 
 | Area | State |
