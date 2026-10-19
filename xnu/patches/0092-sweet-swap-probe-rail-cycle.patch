@@ -1,0 +1,380 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -22,6 +22,8 @@
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int sweet_rpmh_vreg_off(const char *res);
++extern void sweet_rpmh_db_dump(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -100,6 +102,7 @@
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+ 	bool started, dead, probing, bb;
++	uint8_t bb_sda, bb_scl;
+ 	int kind, irq_hint, poll_any;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+@@ -220,6 +223,7 @@
+ 	}
+ 	uint32_t ver = tcm_sp_rd(tcm_sp_core, 0);
+ 	tcm_sp_count = tcm_sp_rd(tcm_sp_core, 4) & 0x7ffu;
++	printf("SWEET TOUCH: spmi core ver=%#x count=%u\n", ver, tcm_sp_count);
+ 	if (ver < 0x50000000u || ver >= 0x70000000u || !tcm_sp_count || tcm_sp_count > 512) {
+ 		tcm_sp_count = 0;
+ 		return false;
+@@ -227,12 +231,33 @@
+ 	return true;
+ }
+ 
++/* First entries of the APID map: shows which PPIDs Apps can reach directly. */
++static void
++tcm_pm_mapdump(void)
++{
++	if (!tcm_pm_init()) {
++		printf("SWEET TOUCH: spmi mapdump unavailable\n");
++		return;
++	}
++	unsigned n = tcm_sp_count < 48u ? tcm_sp_count : 48u;
++	for (unsigned i = 0; i < n; ++i) {
++		uint32_t map = tcm_sp_rd(tcm_sp_core, 0x900u + 4u * i);
++		if (!map) {
++			continue;
++		}
++		unsigned owner = tcm_sp_rd(tcm_sp_cfg, 0x700u + 4u * i) & 7u;
++		printf("SWEET TOUCH: spmi apid=%u map=%#x ppid=%#x owner=%u\n",
++		    i, map, (map >> 8) & 0xfffu, owner);
++	}
++}
++
+ static bool
+ tcm_pm_read(unsigned periph, unsigned reg, uint8_t *out)
+ {
+ 	uint16_t ppid = (uint16_t)((4u << 8) | periph);
+ 	uint16_t apid = 0xffffu;
+ 	if (!tcm_pm_init()) {
++		printf("SWEET TOUCH: pmic rd periph=%#x reg=%#x: init failed\n", periph, reg);
+ 		return false;
+ 	}
+ 	for (unsigned i = 0; i < tcm_sp_count; ++i) {
+@@ -246,6 +271,8 @@
+ 		}
+ 	}
+ 	if (apid == 0xffffu) {
++		printf("SWEET TOUCH: pmic rd periph=%#x reg=%#x: ppid %#x not in apid map\n",
++		    periph, reg, ppid);
+ 		return false;
+ 	}
+ 	unsigned off = 0x80u * apid;
+@@ -257,6 +284,8 @@
+ 		uint32_t status = tcm_sp_rd(tcm_sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				printf("SWEET TOUCH: pmic rd periph=%#x reg=%#x: status=%#x\n",
++				    periph, reg, status);
+ 				return false;
+ 			}
+ 			*out = (uint8_t)tcm_sp_rd(tcm_sp_obs, off + 0x18u);
+@@ -264,6 +293,8 @@
+ 		}
+ 		delay(1);
+ 	}
++	printf("SWEET TOUCH: pmic rd periph=%#x reg=%#x: apid=%u timeout status=%#x\n",
++	    periph, reg, apid, tcm_sp_rd(tcm_sp_obs, off + 0x08u));
+ 	return false;
+ }
+ 
+@@ -475,29 +506,29 @@
+ static void
+ bb_sda_low(void)
+ {
+-	bb_oe(6, true);
++	bb_oe(st.bb_sda, true);
+ 	delay(BB_HALF);
+ }
+ 
+ static void
+ bb_sda_high(void)
+ {
+-	bb_oe(6, false);
++	bb_oe(st.bb_sda, false);
+ 	delay(BB_HALF);
+ }
+ 
+ static void
+ bb_scl_low(void)
+ {
+-	bb_oe(7, true);
++	bb_oe(st.bb_scl, true);
+ 	delay(BB_HALF);
+ }
+ 
+ static void
+ bb_scl_high(void)
+ {
+-	bb_oe(7, false);
+-	for (unsigned i = 0; i < 1000 && !bb_level(7); ++i) {
++	bb_oe(st.bb_scl, false);
++	for (unsigned i = 0; i < 1000 && !bb_level(st.bb_scl); ++i) {
+ 		delay(1); /* bounded slave clock stretching */
+ 	}
+ 	delay(BB_HALF);
+@@ -535,7 +566,7 @@
+ 	}
+ 	bb_sda_high(); /* release SDA for the ACK slot */
+ 	bb_scl_high();
+-	bool ack = !bb_level(6);
++	bool ack = !bb_level(st.bb_sda);
+ 	bb_scl_low();
+ 	return ack;
+ }
+@@ -547,7 +578,7 @@
+ 	for (int i = 7; i >= 0; --i) {
+ 		b <<= 1;
+ 		bb_scl_high();
+-		if (bb_level(6)) {
++		if (bb_level(st.bb_sda)) {
+ 			b |= 1u;
+ 		}
+ 		bb_scl_low();
+@@ -567,20 +598,35 @@
+ static void
+ bb_recover(void)
+ {
+-	if (bb_level(6)) {
++	if (bb_level(st.bb_sda)) {
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: bitbang SDA low before start; recovering\n");
+-	for (unsigned i = 0; i < 9 && !bb_level(6); ++i) {
++	for (unsigned i = 0; i < 9 && !bb_level(st.bb_sda); ++i) {
+ 		bb_scl_high();
+ 		bb_scl_low();
+ 	}
+ 	bb_stop();
+-	if (!bb_level(6)) {
++	if (!bb_level(st.bb_sda)) {
+ 		printf("SWEET TOUCH: bitbang SDA still low after recovery\n");
+ 	}
+ }
+ 
++/* Hold SDA driven high while clocking 16 times: frees a slave that is
++ * waiting for SDA to go high inside a byte. Then release both lines. */
++static void
++bb_bus_free(void)
++{
++	touch_gpio_mi(st.bb_sda, 0, 3, 3, true, true); /* latch high, OE on */
++	for (unsigned i = 0; i < 16; ++i) {
++		bb_scl_high();
++		bb_scl_low();
++	}
++	bb_oe(st.bb_sda, false);
++	touch_gpio_mi(st.bb_sda, 0, 3, 0, true, false); /* back to input latch-low */
++	delay(BB_HALF);
++}
++
+ /* Same contract as touch_msg_run: write XOR read, ≤3 TX, ≤90 RX. */
+ static int
+ touch_msg_bb(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+@@ -1399,23 +1445,37 @@
+ 		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+ 		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+ 		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
+-		 * 0091: prove where sda/scl=0 comes from — raw TLMM state
+-		 * before config, PMIC LDO registers before/after the vote,
+-		 * cfg write landing, and a forced drive-high against any
+-		 * external hold.
++		 * 0092: 0091 proved TLMM writes land and SDA is hard-clamped
++		 * (beats 8 mA) even with the chip in reset. Now: SPMI map +
++		 * cmd-db inventory, rail power-cycle with bus sampling, a
++		 * bus-free recovery that drives SDA high, and a second probe
++		 * attempt with the bit-bang pins swapped (SE7 SDA/SCL order).
+ 		 */
+ 		st.bb = true;
++		st.bb_sda = 6;
++		st.bb_scl = 7;
+ 		printf("SWEET TOUCH: tlmm before cfg6=%#x cfg7=%#x cfg8=%#x cfg9=%#x"
+ 		    " io6=%#x io7=%#x io8=%#x io9=%#x\n",
+ 		    touch_rd(st.gpio, TOUCH_GPIO_CFG(6)), touch_rd(st.gpio, TOUCH_GPIO_CFG(7)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_CFG(8)), touch_rd(st.gpio, TOUCH_GPIO_CFG(9)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)), touch_rd(st.gpio, TOUCH_GPIO_IO(7)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
++		tcm_pm_mapdump();
+ 		tcm_pm_dump("ldoa10 pre", 0x1d);
+ 		tcm_pm_dump("ldoc7 pre", 0x17);
++		sweet_rpmh_db_dump();
++		int o1 = sweet_rpmh_vreg_off("ldoa10");
++		int o2 = sweet_rpmh_vreg_off("ldoc7");
++		touch_wait(50);
++		printf("SWEET TOUCH: rails off o1=%d o2=%d bus sda=%#x scl=%#x\n",
++		    o1, o2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+ 		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+ 		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
+-		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d\n", p1, p2);
++		touch_wait(500);
++		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d bus sda=%#x scl=%#x\n",
++		    p1, p2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+ 		tcm_pm_dump("ldoa10 post", 0x1d);
+ 		tcm_pm_dump("ldoc7 post", 0x17);
+ 		touch_gpio_mi(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+@@ -1444,6 +1504,10 @@
+ 		printf("SWEET TOUCH: bb pins sda=%#x scl=%#x\n",
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
++		bb_bus_free();
++		printf("SWEET TOUCH: bus-free sda=%#x scl=%#x\n",
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+ 		touch_wait(200); /* synaptics,power-delay-ms */
+ 		touch_wait(20);  /* synaptics,reset-active-ms (already low) */
+ 		touch_gpio(8, 0, 3, 3, true, true); /* reset released */
+@@ -1455,14 +1519,25 @@
+ 		st.probing = true;
+ 		int te = tcm_probe();
+ 		st.probing = false;
+-		if (st.dead || te) {
+-			printf("SWEET TOUCH: synaptics probe err=%d dead=%d; stopping\n",
++		if ((st.dead || te) && te) {
++			printf("SWEET TOUCH: probe A sda=6 scl=7 err=%d dead=%d; retry swapped\n",
+ 			    te, st.dead);
++			st.dead = false;
++			st.bb_sda = 7;
++			st.bb_scl = 6;
++			bb_bus_free();
++			st.probing = true;
++			te = tcm_probe();
++			st.probing = false;
++		}
++		if (st.dead || te) {
++			printf("SWEET TOUCH: synaptics probe err=%d dead=%d sda=%u scl=%u; stopping\n",
++			    te, st.dead, st.bb_sda, st.bb_scl);
+ 			goto out;
+ 		}
+ 		st.kind = TOUCH_SYNAPTICS;
+-		printf("SWEET TOUCH: selected Synaptics TCM @0x20, %ux%u objects=%u, "
+-		    "poll=10ms irq-hint=%d\n", st.tcm_max_x, st.tcm_max_y,
++		printf("SWEET TOUCH: selected Synaptics TCM @0x20 sda=%u scl=%u, %ux%u objects=%u, "
++		    "poll=10ms irq-hint=%d\n", st.bb_sda, st.bb_scl, st.tcm_max_x, st.tcm_max_y,
+ 		    st.tcm_max_objects, st.irq_hint);
+ 	} else {
+ 	printf("SWEET TOUCH: voting L11C through RPMh\n");
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_vreg_off(const char *res);
++void sweet_rpmh_db_dump(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -219,7 +221,7 @@
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned mv, unsigned en)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -268,8 +270,8 @@
+ 	rh_poisoned = true;
+ 	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
++	const uint32_t values[3] = {mv, 7, en};
++	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=%u irq-enable=%#x\n", t, mv, en, irq_en);
+ 	for (unsigned c = 0; c < 3; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -353,7 +355,7 @@
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		error = rh_send(address, mv, 1);
+ 	}
+ out:
+ 	if (error) {
+@@ -362,4 +364,75 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++int
++sweet_rpmh_vreg_off(const char *res)
++{
++	/* Same whitelist and nominal voltage; only the enable vote flips. */
++	unsigned mv = strcmp(res, "ldoc11") == 0 ? 3200u
++	    : strcmp(res, "ldoa10") == 0 ? 1800u
++	    : strcmp(res, "ldoc7") == 0 ? 3000u : 0u;
++	if (!mv) {
++		printf("SWEET RPMH: off: unknown resource\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		error = rh_send(address, mv, 0);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: off failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* One line per cmd-db resource: name, vote address, slave. */
++void
++sweet_rpmh_db_dump(void)
++{
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	if (rh_map()) {
++		goto out;
++	}
++	for (unsigned i = 0; ; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		unsigned count = rh_db16(h + 6);
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY)) {
++			break;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			char name[9] = {0};
++			for (unsigned k = 0; k < 8; ++k) {
++				name[k] = (char)(rh_read(rh_db, e + 4u * (k / 4)) >>
++				    (8u * (k % 4)) & 0xffu);
++			}
++			printf("SWEET RPMH: db %s addr=%#x slave=%u\n",
++			    name, rh_read(rh_db, e + 16), slave);
++		}
++	}
++out:
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
