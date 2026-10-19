@@ -1,0 +1,82 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -239,7 +239,7 @@
+ 		printf("SWEET TOUCH: spmi mapdump unavailable\n");
+ 		return;
+ 	}
+-	unsigned n = tcm_sp_count < 48u ? tcm_sp_count : 48u;
++	unsigned n = tcm_sp_count < 128u ? tcm_sp_count : 128u;
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		uint32_t map = tcm_sp_rd(tcm_sp_core, 0x900u + 4u * i);
+ 		if (!map) {
+@@ -1445,11 +1445,10 @@
+ 		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+ 		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+ 		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
+-		 * 0092: 0091 proved TLMM writes land and SDA is hard-clamped
+-		 * (beats 8 mA) even with the chip in reset. Now: SPMI map +
+-		 * cmd-db inventory, rail power-cycle with bus sampling, a
+-		 * bus-free recovery that drives SDA high, and a second probe
+-		 * attempt with the bit-bang pins swapped (SE7 SDA/SCL order).
++		 * 0093: prove whether our RPMh vote physically reaches the
++		 * PMIC (ldoc2 CONTROL readback around a VRM vote) and dump
++		 * the full SPMI APID map; the 0092 power-cycle/swap-probe
++		 * diagnostics stay in place.
+ 		 */
+ 		st.bb = true;
+ 		st.bb_sda = 6;
+@@ -1464,6 +1463,25 @@
+ 		tcm_pm_dump("ldoa10 pre", 0x1d);
+ 		tcm_pm_dump("ldoc7 pre", 0x17);
+ 		sweet_rpmh_db_dump();
++		/*
++		 * Vote-readback proof: ldoc2 (sid4 periph 0x08, apid6) is
++		 * Apps-observer-readable.  Vote it via VRM and re-read
++		 * CONTROL(0x04): bit7 flipping = our votes physically reach
++		 * the PMIC; no flip = the RPMh vote path is the real bug.
++		 */
++		uint8_t c0 = 0, vs = 0;
++		bool rr0 = tcm_pm_read(0x08, 0x04, &c0);
++		bool rr1 = tcm_pm_read(0x08, 0x40, &vs);
++		unsigned mv2 = (rr1 && vs) ? (unsigned)vs * 8u : 1200u;
++		if (mv2 < 1150 || mv2 > 1350) {
++			mv2 = 1200;
++		}
++		int v2 = sweet_rpmh_vreg_enable("ldoc2", mv2);
++		touch_wait(20);
++		uint8_t c1 = 0;
++		bool rr2 = tcm_pm_read(0x08, 0x04, &c1);
++		printf("SWEET TOUCH: ldoc2 vote-proof control %#x->%#x vset=%#x mv=%u vote=%d ok=%d%d%d\n",
++		    c0, c1, vs, mv2, v2, (int)rr0, (int)rr1, (int)rr2);
+ 		int o1 = sweet_rpmh_vreg_off("ldoa10");
+ 		int o2 = sweet_rpmh_vreg_off("ldoc7");
+ 		touch_wait(50);
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -334,11 +334,13 @@
+ 	 * DT voltage range (sweet ldoc11; miatoll ldoa10/ldoc7).
+ 	 */
+ 	if (!res ||
+-	    (strcmp(res, "ldoc11") && strcmp(res, "ldoa10") && strcmp(res, "ldoc7")) ||
++	    (strcmp(res, "ldoc11") && strcmp(res, "ldoa10") && strcmp(res, "ldoc7") &&
++	     strcmp(res, "ldoc2")) ||
+ 	    (strcmp(res, "ldoc11") == 0 && (mv < 2950 || mv > 3400)) ||
+ 	    (strcmp(res, "ldoa10") == 0 && (mv < 1700 || mv > 1900)) ||
+-	    (strcmp(res, "ldoc7") == 0 && (mv < 2950 || mv > 3350))) {
+-		printf("SWEET RPMH: expected ldoc11 2950..3400, ldoa10 1700..1900 or ldoc7 2950..3350\n");
++	    (strcmp(res, "ldoc7") == 0 && (mv < 2950 || mv > 3350)) ||
++	    (strcmp(res, "ldoc2") == 0 && (mv < 1150 || mv > 1350))) {
++		printf("SWEET RPMH: expected ldoc11 2950..3400, ldoa10 1700..1900, ldoc7 2950..3350 or ldoc2 1150..1350\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -371,7 +373,8 @@
+ 	/* Same whitelist and nominal voltage; only the enable vote flips. */
+ 	unsigned mv = strcmp(res, "ldoc11") == 0 ? 3200u
+ 	    : strcmp(res, "ldoa10") == 0 ? 1800u
+-	    : strcmp(res, "ldoc7") == 0 ? 3000u : 0u;
++	    : strcmp(res, "ldoc7") == 0 ? 3000u
++	    : strcmp(res, "ldoc2") == 0 ? 1200u : 0u;
+ 	if (!mv) {
+ 		printf("SWEET RPMH: off: unknown resource\n");
+ 		return EINVAL;
