@@ -1,0 +1,16 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -546,7 +546,12 @@
+ 	 */
+ 	printf("SWEET TOUCH: skip force_default (0x20)\n");
+ 	se_wr(st.se, SE_CLK_SEL, 0);
+-	se_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	/*
++	 * GENI_SER_M_CLK_CFG (0x48): the 0086 store `0x48=0x71` is the last
++	 * line before the crash (SCL's se_wr print never appeared).  ABL
++	 * already clocks the core (fw 0x303 runs, clocks=1) — skip like 0x20.
++	 */
++	printf("SWEET TOUCH: skip mclk (0x48)\n");
+ 	se_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+ 	se_wr(st.se, 0x254, 0);
