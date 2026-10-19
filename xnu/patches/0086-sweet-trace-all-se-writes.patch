@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -93,6 +93,10 @@
+ static void
+ touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ {
++	/* Trace every SE7 store: the last printed offset before the
++	 * console stops is the one that wedges the bus. */
++	if (st.se && base == st.se)
++		printf("SWEET TOUCH: se_wr %#x=%#x\n", off, val);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(base + off) = val;
+ 	__asm__ volatile("dsb osh" ::: "memory");
+@@ -493,12 +497,9 @@
+ 	return 0;
+ }
+ 
+-/* Trace every SE7 register write during bring-up: the last printed
+- * offset before the console stops is the one that hangs the bus. */
+ static void
+ se_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ {
+-	printf("SWEET TOUCH: se_wr %#x=%#x\n", off, val);
+ 	touch_wr(base, off, val);
+ }
+ 
+@@ -512,13 +513,12 @@
+ 	    touch_rd(st.se, 0x908));
+ 	/*
+ 	 * SE+0x64 is GENI_IF_DISABLE_RO (not an IRQ mask): bit0 set means the
+-	 * FIFO interface is disabled and the SE runs in DMA/GPI mode.  Print
+-	 * the mode registers so a boot photo shows which path ABL left us on.
++	 * FIFO interface is disabled and the SE runs in DMA/GPI mode.  0x64
++	 * reads are proven (0083/0084); the 0085 diagnostic also read
++	 * 0x60/0x258/0x2004/0x2008 and hung the bus before any of it printed,
++	 * so only the proven register is read here.
+ 	 */
+-	printf("SWEET TOUCH: se7 if_dis=%#x clk_ctrl=%#x dma_en=%#x "
+-	    "dma_if=%#x fifo_if_dis=%#x\n",
+-	    touch_rd(st.se, 0x64), touch_rd(st.se, 0x60), touch_rd(st.se, SE_DMA),
+-	    touch_rd(st.se, 0x2004), touch_rd(st.se, 0x2008));
++	printf("SWEET TOUCH: se7 if_dis=%#x\n", touch_rd(st.se, 0x64));
+ 	if (((fw >> 8) & 0xffu) != 3u ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
