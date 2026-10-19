@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -535,6 +535,18 @@
+ 	se_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	se_wr(st.se, 0x648, 0xffffffffu);
+ 	se_wr(st.se, SE_DMA, 0);
++	/*
++	 * geni_load_se_firmware() always sets SE_DMA_IF_EN.DMA_IF_EN, then
++	 * sets/clears SE_FIFO_IF_DISABLE.FIFO_IF_DISABLE for the load mode.
++	 * ABL loaded SE7 in GPI mode (if_dis=0x1), so our TX words sat unread
++	 * and IDENTIFY never clocked the wire (0087: tx=3 rx=0 err=60, abort
++	 * failed).  Do the GENI_SE_FIFO side of the switch: DMA IF on, FIFO
++	 * disable off.  Blind constant stores — reads of 0x2004/0x2008 were
++	 * suspects in the 0085 hang; 0x64 is proven and confirms the mux.
++	 */
++	se_wr(st.se, 0x2004, 1u); /* SE_DMA_IF_EN: DMA_IF_EN */
++	se_wr(st.se, 0x2008, 0u); /* SE_FIFO_IF_DISABLE: route to FIFO */
++	printf("SWEET TOUCH: if_dis now=%#x\n", touch_rd(st.se, 0x64));
+ 	se_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+ 	se_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+ 	se_wr(st.se, 0x24, 0x7f);
