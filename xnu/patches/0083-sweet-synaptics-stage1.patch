@@ -1,0 +1,148 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,9 +327,16 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * Board-specific helper: only the known touch rails, each with its
++	 * DT voltage range (sweet ldoc11; miatoll ldoa10/ldoc7).
++	 */
++	if (!res ||
++	    (strcmp(res, "ldoc11") && strcmp(res, "ldoa10") && strcmp(res, "ldoc7")) ||
++	    (strcmp(res, "ldoc11") == 0 && (mv < 2950 || mv > 3400)) ||
++	    (strcmp(res, "ldoa10") == 0 && (mv < 1700 || mv > 1900)) ||
++	    (strcmp(res, "ldoc7") == 0 && (mv < 2950 || mv > 3350))) {
++		printf("SWEET RPMH: expected ldoc11 2950..3400, ldoa10 1700..1900 or ldoc7 2950..3350\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -14,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -160,8 +161,13 @@
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	/* Wrap1 S1 (0x18144) is SE7's branch; skip branches we did not enable
++	 * (Atoll wrap0 SE4 stays halted with CLK_ENABLE off). */
++	const uint32_t branches[] = {0x18144, 0x18004, 0x18008, 0x1800c, 0x18010};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if ((touch_rd(st.gcc, branches[i]) & 1u) == 0) {
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+@@ -495,7 +501,12 @@
+ 	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
++	/*
++	 * Joyeuse ABL leaves M_CMD_DONE enabled at SE+0x64 while the SE is
++	 * idle; the busy check below catches an SE in active use.
++	 */
++	printf("SWEET TOUCH: se7 mirqen=%#x\n", touch_rd(st.se, 0x64));
++	if (((fw >> 8) & 0xffu) != 3u ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+ 	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+ 		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+@@ -545,6 +556,26 @@
+ 	return true;
+ }
+ 
++static bool
++touch_is_miatoll(void)
++{
++	DTEntry root;
++	const char *compat;
++	unsigned long size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size)
++	        != kSuccess || !compat) {
++		return false;
++	}
++	for (const char *s = compat; *s; s += strlen(s) + 1) {
++		if (!strcmp(s, "xiaomi,miatoll")) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -566,12 +597,56 @@
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
++	bool ci = touch_clocks();
++	printf("SWEET TOUCH: clocks=%d\n", ci);
++	bool si = ci && touch_se_init();
++	printf("SWEET TOUCH: se_init=%d\n", si);
++	if (!si) {
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
++	bool miatoll = touch_is_miatoll();
++	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; device=%s\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+-	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)), miatoll ? "miatoll" : "sweet");
++	if (miatoll) {
++		/* Stage 1 (observation only): rails, reset, one IDENTIFY exchange. */
++		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
++		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
++		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d\n", p1, p2);
++		touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
++		touch_gpio(8, 0, 3, 3, true, false);
++		touch_gpio(6, 1, 0, 0, false, false); /* qup SDA/SCL, 2 mA */
++		touch_gpio(7, 1, 0, 0, false, false);
++		touch_wait(200); /* synaptics,power-delay-ms */
++		touch_gpio(8, 0, 3, 3, true, true); /* reset released */
++		touch_wait(200); /* synaptics,reset-delay-ms */
++		printf("SWEET TOUCH: stage1 after reset irqline=%#x\n",
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
++		st.probing = true;
++		const uint8_t idcmd[3] = { 0x02, 0, 0 }; /* TCM_CMD_IDENTIFY */
++		int we = touch_msg(0x20, idcmd, 3, NULL, 0, false);
++		printf("SWEET TOUCH: stage1 identify write err=%d\n", we);
++		for (unsigned n = 0; n < 12 && !st.dead; ++n) {
++			uint8_t buf[40];
++			int re = touch_msg(0x20, NULL, 0, buf, sizeof(buf), false);
++			printf("SWEET TOUCH: stage1 read%u err=%d irqline=%#x:",
++			    n, re, touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
++			if (!re) {
++				for (unsigned b = 0; b < sizeof(buf); ++b) {
++					printf(" %02x", buf[b]);
++				}
++			}
++			printf("\n");
++			if (re) {
++				break;
++			}
++			touch_wait(30);
++		}
++		st.probing = false;
++		printf("SWEET TOUCH: stage1 done dead=%d\n", st.dead);
++		goto out;
++	}
++	printf("SWEET TOUCH: voting L11C through RPMh\n");
+ 	/* Keep the IC in reset while its rails settle; IRQ stays an input. */
+ 	touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 	touch_gpio(8, 0, 3, 3, true, false);
