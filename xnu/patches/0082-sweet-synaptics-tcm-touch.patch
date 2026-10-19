@@ -127,7 +127,26 @@
  
  static uint32_t
  touch_rd(vm_offset_t base, uint32_t off)
-@@ -487,6 +520,451 @@
+@@ -160,8 +193,17 @@
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t branches[] = {0x18144, 0x18004, 0x18008, 0x1800c, 0x18010};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		/*
++		 * Wrap1 S1 (0x18144) is SE7's branch. Other wrappers' SEs are
++		 * not ours: on Atoll wrap0 SE4 (0x18010) reads halted with
++		 * CLK_ENABLE off (0x8000000a) and never clears, so only wait
++		 * on branches that are enabled (bit0), checked first.
++		 */
++		if ((touch_rd(st.gcc, branches[i]) & 1u) == 0) {
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
+@@ -487,6 +529,451 @@
  	return 0;
  }
  
@@ -579,7 +598,7 @@
  static bool
  touch_se_init(void)
  {
-@@ -549,6 +1027,7 @@
+@@ -549,6 +1036,7 @@
  touch_thread(void *arg, wait_result_t result)
  {
  	unsigned delay_s = 45;
@@ -587,7 +606,7 @@
  	(void)arg;
  	(void)result;
  	/*
-@@ -556,6 +1035,8 @@
+@@ -556,6 +1044,8 @@
  	 * below hangs the SoC, the persistent log and the GUI got there first.
  	 */
  	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
@@ -596,7 +615,7 @@
  	printf("SWEET TOUCH: starting in %u s\n", delay_s);
  	touch_wait(delay_s * 1000u);
  	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
-@@ -569,12 +1050,39 @@
+@@ -569,12 +1059,39 @@
  	if (!touch_clocks() || !touch_se_init()) {
  		goto out;
  	}
@@ -638,7 +657,7 @@
  	int power_error = sweet_rpmh_vreg_enable("ldoc11", 3200);
  	if (power_error) {
  		printf("SWEET TOUCH: L11C RPMh enable failed %d; probes skipped\n", power_error);
-@@ -610,12 +1118,14 @@
+@@ -610,12 +1127,14 @@
  	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
  	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
  	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
