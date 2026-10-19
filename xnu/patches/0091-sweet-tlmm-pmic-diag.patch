@@ -1,0 +1,180 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -171,6 +171,122 @@
+ 	touch_wr(st.gpio, off, cfg);
+ }
+ 
++/*
++ * Absolute TLMM config write used by the miatoll bit-bang path: no
++ * read-modify-write, so a garbage read cannot mask the mux/pull/OE fields.
++ */
++static void
++touch_gpio_mi(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	if (out) {
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
++		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin),
++	    (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u));
++}
++
++/*
++ * Observer-mode SPMI reads for the touch-rail LDOs (PM6150L, SID 4).
++ * Same proven lane mechanism as sweet_keys/sweet_spmi; read-only, own
++ * PPIDs (0x41d = ldoa10 periph 0x1d, 0x417 = ldoc7 periph 0x17).
++ */
++#define TCM_SP_CORE_PA  0x0c440000u
++#define TCM_SP_OBS_PA   0x0e600000u
++#define TCM_SP_CFG_PA   0x0c40a000u
++
++static vm_offset_t tcm_sp_core, tcm_sp_obs, tcm_sp_cfg;
++static unsigned tcm_sp_count;
++
++static uint32_t
++tcm_sp_rd(vm_offset_t base, unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static bool
++tcm_pm_init(void)
++{
++	if (tcm_sp_core) {
++		return tcm_sp_count != 0;
++	}
++	tcm_sp_core = ml_io_map(TCM_SP_CORE_PA, 0x2000);
++	tcm_sp_cfg = ml_io_map(TCM_SP_CFG_PA, 0x1000);
++	tcm_sp_obs = ml_io_map(TCM_SP_OBS_PA, 0x10000);
++	if (!tcm_sp_core || !tcm_sp_cfg || !tcm_sp_obs) {
++		return false;
++	}
++	uint32_t ver = tcm_sp_rd(tcm_sp_core, 0);
++	tcm_sp_count = tcm_sp_rd(tcm_sp_core, 4) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || !tcm_sp_count || tcm_sp_count > 512) {
++		tcm_sp_count = 0;
++		return false;
++	}
++	return true;
++}
++
++static bool
++tcm_pm_read(unsigned periph, unsigned reg, uint8_t *out)
++{
++	uint16_t ppid = (uint16_t)((4u << 8) | periph);
++	uint16_t apid = 0xffffu;
++	if (!tcm_pm_init()) {
++		return false;
++	}
++	for (unsigned i = 0; i < tcm_sp_count; ++i) {
++		uint32_t map = tcm_sp_rd(tcm_sp_core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		unsigned owner = tcm_sp_rd(tcm_sp_cfg, 0x700u + 4u * i) & 7u;
++		if (apid == 0xffffu || owner == 0) {
++			apid = (uint16_t)i;
++		}
++	}
++	if (apid == 0xffffu) {
++		return false;
++	}
++	unsigned off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((reg & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(tcm_sp_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = tcm_sp_rd(tcm_sp_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)tcm_sp_rd(tcm_sp_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* Dump the PMIC registers our RPMh vote touches (0/4/8) plus likely status. */
++static void
++tcm_pm_dump(const char *tag, unsigned periph)
++{
++	static const unsigned regs[] = {0x00, 0x04, 0x08, 0x38, 0x39, 0x40, 0x45, 0x46, 0x47, 0x48};
++	uint8_t v[10];
++	bool ok = true;
++	for (unsigned i = 0; ok && i < 10; ++i) {
++		ok = tcm_pm_read(periph, regs[i], &v[i]);
++	}
++	if (!ok) {
++		printf("SWEET TOUCH: pmic %s sid4 periph=%#x read failed\n", tag, periph);
++		return;
++	}
++	printf("SWEET TOUCH: pmic %s %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x"
++	    " %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x\n", tag,
++	    regs[0], v[0], regs[1], v[1], regs[2], v[2], regs[3], v[3], regs[4], v[4],
++	    regs[5], v[5], regs[6], v[6], regs[7], v[7], regs[8], v[8], regs[9], v[9]);
++}
++
+ static bool
+ touch_clocks(void)
+ {
+@@ -1283,18 +1399,48 @@
+ 		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+ 		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+ 		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
++		 * 0091: prove where sda/scl=0 comes from — raw TLMM state
++		 * before config, PMIC LDO registers before/after the vote,
++		 * cfg write landing, and a forced drive-high against any
++		 * external hold.
+ 		 */
+ 		st.bb = true;
++		printf("SWEET TOUCH: tlmm before cfg6=%#x cfg7=%#x cfg8=%#x cfg9=%#x"
++		    " io6=%#x io7=%#x io8=%#x io9=%#x\n",
++		    touch_rd(st.gpio, TOUCH_GPIO_CFG(6)), touch_rd(st.gpio, TOUCH_GPIO_CFG(7)),
++		    touch_rd(st.gpio, TOUCH_GPIO_CFG(8)), touch_rd(st.gpio, TOUCH_GPIO_CFG(9)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)), touch_rd(st.gpio, TOUCH_GPIO_IO(7)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
++		tcm_pm_dump("ldoa10 pre", 0x1d);
++		tcm_pm_dump("ldoc7 pre", 0x17);
+ 		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+ 		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
+ 		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d\n", p1, p2);
+-		touch_gpio(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+-		touch_gpio(8, 0, 3, 3, true, false);  /* reset held low */
++		tcm_pm_dump("ldoa10 post", 0x1d);
++		tcm_pm_dump("ldoc7 post", 0x17);
++		touch_gpio_mi(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
++		touch_gpio_mi(8, 0, 3, 3, true, false);  /* reset held low */
+ 		/* Arm the output latch low, then release to input (pull-up). */
+-		touch_gpio(6, 0, 3, 0, true, false);
+-		touch_gpio(6, 0, 3, 0, false, false);
+-		touch_gpio(7, 0, 3, 0, true, false);
+-		touch_gpio(7, 0, 3, 0, false, false);
++		touch_gpio_mi(6, 0, 3, 0, true, false);
++		touch_gpio_mi(6, 0, 3, 0, false, false);
++		touch_gpio_mi(7, 0, 3, 0, true, false);
++		touch_gpio_mi(7, 0, 3, 0, false, false);
++		printf("SWEET TOUCH: tlmm after cfg6=%#x cfg7=%#x cfg8=%#x cfg9=%#x"
++		    " io6=%#x io7=%#x io8=%#x io9=%#x\n",
++		    touch_rd(st.gpio, TOUCH_GPIO_CFG(6)), touch_rd(st.gpio, TOUCH_GPIO_CFG(7)),
++		    touch_rd(st.gpio, TOUCH_GPIO_CFG(8)), touch_rd(st.gpio, TOUCH_GPIO_CFG(9)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)), touch_rd(st.gpio, TOUCH_GPIO_IO(7)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
++		/* Force both lines high: proves pad drive; low = external hold. */
++		touch_gpio_mi(6, 0, 3, 3, true, true);
++		touch_gpio_mi(7, 0, 3, 3, true, true);
++		printf("SWEET TOUCH: bb drive-high sda=%#x scl=%#x\n",
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
++		touch_gpio_mi(6, 0, 3, 0, true, false);
++		touch_gpio_mi(6, 0, 3, 0, false, false);
++		touch_gpio_mi(7, 0, 3, 0, true, false);
++		touch_gpio_mi(7, 0, 3, 0, false, false);
+ 		printf("SWEET TOUCH: bb pins sda=%#x scl=%#x\n",
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
