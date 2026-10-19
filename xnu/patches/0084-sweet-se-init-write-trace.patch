@@ -1,0 +1,70 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -493,6 +493,15 @@
+ 	return 0;
+ }
+ 
++/* Trace every SE7 register write during bring-up: the last printed
++ * offset before the console stops is the one that hangs the bus. */
++static void
++se_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	printf("SWEET TOUCH: se_wr %#x=%#x\n", off, val);
++	touch_wr(base, off, val);
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -516,29 +525,29 @@
+ 		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
+ 		return false;
+ 	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
++	se_wr(st.se, 0xe18, 0); /* no GSI events */
++	se_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
++	se_wr(st.se, 0x644, 0);
++	se_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	se_wr(st.se, 0x648, 0xffffffffu);
++	se_wr(st.se, SE_DMA, 0);
++	se_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
++	se_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
++	se_wr(st.se, 0x24, 0x7f);
++	se_wr(st.se, 0x20, 1);
++	se_wr(st.se, SE_CLK_SEL, 0);
++	se_wr(st.se, SE_MCLK, (7u << 4) | 1u);
++	se_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+ 	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	se_wr(st.se, 0x254, 0);
++	se_wr(st.se, 0x260, SE_PACK0);
++	se_wr(st.se, 0x264, SE_PACK1);
++	se_wr(st.se, 0x284, SE_PACK0);
++	se_wr(st.se, 0x288, SE_PACK1);
++	se_wr(st.se, SE_TX_WM, 0);
++	se_wr(st.se, 0x810, 0);
++	se_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	se_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+ 	printf("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+ 	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+ 	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
