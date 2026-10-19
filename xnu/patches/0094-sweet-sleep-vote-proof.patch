@@ -1,0 +1,330 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1,7 +1,9 @@
+ /*
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+- * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ * 0094: active-set votes plus optional sleep-set votes (Linux qcom,set=0x03
++ * votes both; sleep TCS occupy indices 2..4 of this DRV per DT tcs-config).
++ * No wake programming, SPMI writes, GIC handler, or timeout recovery.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -22,6 +24,8 @@
+ #define RH_DICT_PA      0x0c3f000cu
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
++#define RH_SLEEP_FIRST  2u       /* SLEEP occupies TCS 2..4 in this DRV */
++#define RH_SLEEP_N      3u
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+ #define RH_TCS_STRIDE   0x2a0u
+ #define RH_CMD_STRIDE   0x14u
+@@ -220,23 +224,36 @@
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* Pick a free TCS in [lo, lo+n) with no conflicting inherited payload. */
+ static int
+-rh_send(uint32_t address, unsigned mv, unsigned en)
++rh_select(const char *bank, unsigned lo, unsigned n, uint32_t address, int *out)
+ {
+ 	int chosen = -1;
+-	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++	for (unsigned i = 0; i < n; ++i) {
++		unsigned t = lo + i;
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+-		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+-		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++		printf("SWEET RPMH: %s TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    bank, t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+ 		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (enabled) {
++			for (unsigned c = 0; c < rh_ncpt; ++c) {
++				if (enabled & (1u << c)) {
++					printf("SWEET RPMH: %s TCS%u slot%u addr=%#x data=%#x\n",
++					    bank, t, c,
++					    rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE),
++					    rh_read(rh_tcs, b + RH_DATA + c * RH_CMD_STRIDE));
++				}
++			}
++		}
+ 		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited L11C request in %s TCS%u\n",
++				    bank, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -245,10 +262,17 @@
+ 		}
+ 	}
+ 	if (chosen < 0) {
+-		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		printf("SWEET RPMH: no empty idle %s TCS; leaving inherited state intact\n", bank);
+ 		return EBUSY;
+ 	}
+-	unsigned t = (unsigned)chosen;
++	*out = chosen;
++	return 0;
++}
++
++/* Arm the three VRM commands in TCS slot t, trigger, wait for completion. */
++static int
++rh_fire(unsigned t, const char *bank, uint32_t address, unsigned mv, unsigned en)
++{
+ 	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+ 	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
+ 	if (irq_en == 0xffffffffu || !rh_free(t)) {
+@@ -271,7 +295,8 @@
+ 	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+ 	const uint32_t values[3] = {mv, 7, en};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=%u irq-enable=%#x\n", t, mv, en, irq_en);
++	printf("SWEET RPMH: %s TCS%u %u mV mode=7 enable=%u irq-enable=%#x\n",
++	    bank, t, mv, en, irq_en);
+ 	for (unsigned c = 0; c < 3; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -305,8 +330,8 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: %s TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	    bank, t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+@@ -322,17 +347,26 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s TCS%u vote complete (rail voltage requires hardware verification)\n",
++	    bank, t);
+ 	return 0;
+ }
+ 
+-int
+-sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++static int
++rh_send(uint32_t address, unsigned mv, unsigned en)
++{
++	int chosen = 0;
++	int error = rh_select("ACTIVE", 0, RH_ACTIVE_N, address, &chosen);
++	if (!error) {
++		error = rh_fire((unsigned)chosen, "ACTIVE", address, mv, en);
++	}
++	return error;
++}
++
++/* Whitelist + DT voltage range check shared by the active and sleep votes. */
++static int
++rh_vote_check(const char *res, unsigned mv)
+ {
+-	/*
+-	 * Board-specific helper: only the known touch rails, each with its
+-	 * DT voltage range (sweet ldoc11; miatoll ldoa10/ldoc7).
+-	 */
+ 	if (!res ||
+ 	    (strcmp(res, "ldoc11") && strcmp(res, "ldoa10") && strcmp(res, "ldoc7") &&
+ 	     strcmp(res, "ldoc2")) ||
+@@ -343,6 +377,20 @@
+ 		printf("SWEET RPMH: expected ldoc11 2950..3400, ldoa10 1700..1900, ldoc7 2950..3350 or ldoc2 1150..1350\n");
+ 		return EINVAL;
+ 	}
++	return 0;
++}
++
++int
++sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++{
++	/*
++	 * Board-specific helper: only the known touch rails, each with its
++	 * DT voltage range (sweet ldoc11; miatoll ldoa10/ldoc7).
++	 */
++	int check = rh_vote_check(res, mv);
++	if (check) {
++		return check;
++	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
+ 	}
+@@ -365,6 +413,47 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * 0094: mirror the vote into the SLEEP set (TCS 2..4 of this DRV). Linux's
++ * qcom,set=0x03 sends both sets; 0093's active-only votes acked but never
++ * changed any readable PMIC register, so the missing sleep set is the
++ * prime suspect for votes that never physically act.
++ */
++int
++sweet_rpmh_vreg_sleep(const char *res, unsigned mv)
++{
++	int check = rh_vote_check(res, mv);
++	if (check) {
++		return check;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		int chosen = 0;
++		error = rh_select("SLEEP", RH_SLEEP_FIRST, RH_SLEEP_N, address, &chosen);
++		if (!error) {
++			error = rh_fire((unsigned)chosen, "SLEEP", address, mv, 1);
++		}
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: sleep vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ 
+ int
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -23,6 +23,7 @@
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern int sweet_rpmh_vreg_off(const char *res);
++extern int sweet_rpmh_vreg_sleep(const char *res, unsigned mv);
+ extern void sweet_rpmh_db_dump(void);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+@@ -298,14 +299,15 @@
+ 	return false;
+ }
+ 
+-/* Dump the PMIC registers our RPMh vote touches (0/4/8) plus likely status. */
++/* Full plausible PMIC5 LDO window: status/control + VSET pair + mode regs. */
+ static void
+ tcm_pm_dump(const char *tag, unsigned periph)
+ {
+-	static const unsigned regs[] = {0x00, 0x04, 0x08, 0x38, 0x39, 0x40, 0x45, 0x46, 0x47, 0x48};
+-	uint8_t v[10];
++	static const unsigned regs[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x38, 0x39,
++	    0x40, 0x41, 0x44, 0x45, 0x46, 0x47, 0x48};
++	uint8_t v[14];
+ 	bool ok = true;
+-	for (unsigned i = 0; ok && i < 10; ++i) {
++	for (unsigned i = 0; ok && i < 14; ++i) {
+ 		ok = tcm_pm_read(periph, regs[i], &v[i]);
+ 	}
+ 	if (!ok) {
+@@ -313,9 +315,11 @@
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: pmic %s %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x"
+-	    " %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x\n", tag,
++	    " %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x"
++	    " %02x=%02x %02x=%02x\n", tag,
+ 	    regs[0], v[0], regs[1], v[1], regs[2], v[2], regs[3], v[3], regs[4], v[4],
+-	    regs[5], v[5], regs[6], v[6], regs[7], v[7], regs[8], v[8], regs[9], v[9]);
++	    regs[5], v[5], regs[6], v[6], regs[7], v[7], regs[8], v[8], regs[9], v[9],
++	    regs[10], v[10], regs[11], v[11], regs[12], v[12], regs[13], v[13]);
+ }
+ 
+ static bool
+@@ -1445,10 +1449,12 @@
+ 		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+ 		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+ 		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
+-		 * 0093: prove whether our RPMh vote physically reaches the
+-		 * PMIC (ldoc2 CONTROL readback around a VRM vote) and dump
+-		 * the full SPMI APID map; the 0092 power-cycle/swap-probe
+-		 * diagnostics stay in place.
++		 * 0094: is any RPMh vote reaching the PMIC? bobc1 (periph
++		 * 0x04, readable, known ON since UFS runs off it) defines the
++		 * enabled-PMIC5-LDO register pattern; ldoc2 (periph 0x08,
++		 * readable, feeds only BT/WCN RFA) gets a full off/active/sleep
++		 * transition matrix. ldoa10/ldoc7 are NOT in the APID map, so
++		 * their votes keep only bus-sample evidence.
+ 		 */
+ 		st.bb = true;
+ 		st.bb_sda = 6;
+@@ -1460,14 +1466,13 @@
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)), touch_rd(st.gpio, TOUCH_GPIO_IO(7)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+ 		tcm_pm_mapdump();
+-		tcm_pm_dump("ldoa10 pre", 0x1d);
+-		tcm_pm_dump("ldoc7 pre", 0x17);
++		tcm_pm_dump("bobc1 pre", 0x04);
+ 		sweet_rpmh_db_dump();
+ 		/*
+-		 * Vote-readback proof: ldoc2 (sid4 periph 0x08, apid6) is
+-		 * Apps-observer-readable.  Vote it via VRM and re-read
+-		 * CONTROL(0x04): bit7 flipping = our votes physically reach
+-		 * the PMIC; no flip = the RPMh vote path is the real bug.
++		 * Transition matrix: pre-state reads, full dump, vote OFF +
++		 * dump, vote ON(active) + CONTROL proof + dump, vote ON(sleep)
++		 * + dump. Any register that flips between dumps proves our
++		 * votes physically act; bobc1 shows what ON looks like.
+ 		 */
+ 		uint8_t c0 = 0, vs = 0;
+ 		bool rr0 = tcm_pm_read(0x08, 0x04, &c0);
+@@ -1476,12 +1481,21 @@
+ 		if (mv2 < 1150 || mv2 > 1350) {
+ 			mv2 = 1200;
+ 		}
++		tcm_pm_dump("ldoc2 pre", 0x08);
++		int voff = sweet_rpmh_vreg_off("ldoc2");
++		touch_wait(20);
++		tcm_pm_dump("ldoc2 off", 0x08);
+ 		int v2 = sweet_rpmh_vreg_enable("ldoc2", mv2);
+ 		touch_wait(20);
+ 		uint8_t c1 = 0;
+ 		bool rr2 = tcm_pm_read(0x08, 0x04, &c1);
+-		printf("SWEET TOUCH: ldoc2 vote-proof control %#x->%#x vset=%#x mv=%u vote=%d ok=%d%d%d\n",
+-		    c0, c1, vs, mv2, v2, (int)rr0, (int)rr1, (int)rr2);
++		printf("SWEET TOUCH: ldoc2 vote-proof control %#x->%#x vset=%#x mv=%u off=%d vote=%d ok=%d%d%d\n",
++		    c0, c1, vs, mv2, voff, v2, (int)rr0, (int)rr1, (int)rr2);
++		tcm_pm_dump("ldoc2 post", 0x08);
++		int v2s = sweet_rpmh_vreg_sleep("ldoc2", mv2);
++		touch_wait(20);
++		printf("SWEET TOUCH: ldoc2 sleep-vote=%d\n", v2s);
++		tcm_pm_dump("ldoc2 slp", 0x08);
+ 		int o1 = sweet_rpmh_vreg_off("ldoa10");
+ 		int o2 = sweet_rpmh_vreg_off("ldoc7");
+ 		touch_wait(50);
+@@ -1490,12 +1504,12 @@
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+ 		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+ 		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
++		int s1 = sweet_rpmh_vreg_sleep("ldoa10", 1800);
++		int s2 = sweet_rpmh_vreg_sleep("ldoc7", 3000);
+ 		touch_wait(500);
+-		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d bus sda=%#x scl=%#x\n",
+-		    p1, p2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d slp=%d,%d bus sda=%#x scl=%#x\n",
++		    p1, p2, s1, s2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+-		tcm_pm_dump("ldoa10 post", 0x1d);
+-		tcm_pm_dump("ldoc7 post", 0x17);
+ 		touch_gpio_mi(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 		touch_gpio_mi(8, 0, 3, 3, true, false);  /* reset held low */
+ 		/* Arm the output latch low, then release to input (pull-up). */
