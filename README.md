@@ -10,11 +10,13 @@ As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock 
 
 ## Miatoll port (Redmi Note 9 Pro)
 
-A cross-port to the **miatoll** family (Redmi Note 9 Pro, codename `joyeuse`, Qualcomm SM7125 / Snapdragon 720G "Atoll") is in progress. miatoll is the **same Atoll platform** as sweet: GIC, UFS, DWC3, SPMI, IMEM, PSHOLD, GCC, TLMM and the ABL splash framebuffer (`0x9c000000`, 1080×2400) are at identical addresses, so the shim and most of the kernel work unmodified. The differences are handled by the device profile:
+**Install instructions: [INSTALL.md](INSTALL.md).**
+
+A cross-port to the **miatoll** family (Redmi Note 9 Pro, codename `joyeuse`, Qualcomm SM7125 / Snapdragon 720G "Atoll") — boots to the iOS home screen with working touch and all 8 cores (as of 2026-10-20, "Project Droidintosh"). miatoll is the **same Atoll platform** as sweet: GIC, UFS, DWC3, SPMI, IMEM, PSHOLD, GCC, TLMM and the ABL splash framebuffer (`0x9c000000`, 1080×2400) are at identical addresses, so the shim and most of the kernel work unmodified. The differences are handled by the device profile:
 
 - `tools/mkadt.py --device miatoll` — identity strings (`xiaomi,miatoll`, `qcom,sm7125`) and a distinct synthetic ECID; `--phys/--mem` override the RAM window once the live FDT is read (stock DTB has `/memory` zeroed; the shim prints the real banks as `MEM0..` lines at boot).
 - `shim/build.sh` with `DEVICE=miatoll` — uses the miatoll stock DTB (`dtb/miatoll_unpacked/dtb`) and mirrors its boot header (`os_version` Android 15.0.0 / 2026-09). Segment offsets are identical to sweet.
-- **Touch differs:** miatoll uses a **Synaptics TCM** controller (`synaptics,tcm-i2c`, I²C `0x20`) instead of sweet's Goodix GT9896. A new driver is needed; until then boot with `sweettouch=0` (the volume/power keys — same PM6150/PM6150L SPMI/GPIO wiring — work as-is).
+- **Touch:** the fitted controller is a **FocalTech FT8756 on QUP SE11 SPI** (TLMM gpio53–56), not the Synaptics TCM the DT overlays suggest — driver is patch `0098` (bit-bang SPI mode 0, 24-pin-map identify, RAM-load FW download); verified working in iOS. The volume/power keys — same PM6150/PM6150L SPMI/GPIO wiring — work as-is.
 - Panel is `ft8756` or `nt36675` (video mode); not driven by the port (ABL splash framebuffer is used).
 
 `DEVICE=miatoll ./shim/build.sh` builds the miatoll boot image; everything else in this README is unchanged.
@@ -24,7 +26,7 @@ A cross-port to the **miatoll** family (Redmi Note 9 Pro, codename `joyeuse`, Qu
 | Area | State |
 | --- | --- |
 | Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
+| CPU | All 8 cores (six Cortex-A55 + two Cortex-A76) via PSCI, 16K pages, GICv3 interrupts, timers |
 | Memory | About 3.95 GiB of the upper DDR bank |
 | Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
@@ -40,7 +42,7 @@ A cross-port to the **miatoll** family (Redmi Note 9 Pro, codename `joyeuse`, Qu
 
 - **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
 - **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
+- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps.
 - **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
 - **Slow boot:** about 4 minutes on the Apple logo.
 - **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
