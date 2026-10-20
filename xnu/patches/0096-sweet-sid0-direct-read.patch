@@ -1,0 +1,166 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -233,7 +233,7 @@
+ 	return true;
+ }
+ 
+-/* First entries of the APID map: shows which PPIDs Apps can reach directly. */
++/* APID-map entries whose PPID belongs to PM6150 (sid0) or PM6150L (sid4). */
+ static void
+ tcm_pm_mapdump(void)
+ {
+@@ -241,22 +241,26 @@
+ 		printf("SWEET TOUCH: spmi mapdump unavailable\n");
+ 		return;
+ 	}
+-	unsigned n = tcm_sp_count < 128u ? tcm_sp_count : 128u;
+-	for (unsigned i = 0; i < n; ++i) {
++	for (unsigned i = 0; i < tcm_sp_count; ++i) {
+ 		uint32_t map = tcm_sp_rd(tcm_sp_core, 0x900u + 4u * i);
+ 		if (!map) {
+ 			continue;
+ 		}
++		unsigned ppid = (map >> 8) & 0xfffu;
++		unsigned sid = ppid >> 8;
++		if (sid != 0 && sid != 4) {
++			continue;
++		}
+ 		unsigned owner = tcm_sp_rd(tcm_sp_cfg, 0x700u + 4u * i) & 7u;
+ 		printf("SWEET TOUCH: spmi apid=%u map=%#x ppid=%#x owner=%u\n",
+-		    i, map, (map >> 8) & 0xfffu, owner);
++		    i, map, ppid, owner);
+ 	}
+ }
+ 
+ static bool
+-tcm_pm_read(unsigned periph, unsigned reg, uint8_t *out)
++tcm_pm_read(unsigned sid, unsigned periph, unsigned reg, uint8_t *out)
+ {
+-	uint16_t ppid = (uint16_t)((4u << 8) | periph);
++	uint16_t ppid = (uint16_t)((sid & 0xfu) << 8 | (periph & 0xffu));
+ 	uint16_t apid = 0xffffu;
+ 	if (!tcm_pm_init()) {
+ 		printf("SWEET TOUCH: pmic rd periph=%#x reg=%#x: init failed\n", periph, reg);
+@@ -302,17 +306,17 @@
+ 
+ /* Full plausible PMIC5 LDO window: status/control + VSET pair + mode regs. */
+ static void
+-tcm_pm_dump(const char *tag, unsigned periph)
++tcm_pm_dump(const char *tag, unsigned sid, unsigned periph)
+ {
+ 	static const unsigned regs[] = {0x00, 0x04, 0x08, 0x0c, 0x10, 0x38, 0x39,
+ 	    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4c};
+ 	uint8_t v[19];
+ 	bool ok = true;
+ 	for (unsigned i = 0; ok && i < 19; ++i) {
+-		ok = tcm_pm_read(periph, regs[i], &v[i]);
++		ok = tcm_pm_read(sid, periph, regs[i], &v[i]);
+ 	}
+ 	if (!ok) {
+-		printf("SWEET TOUCH: pmic %s sid4 periph=%#x read failed\n", tag, periph);
++		printf("SWEET TOUCH: pmic %s sid%u periph=%#x read failed\n", tag, sid, periph);
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: pmic %s %02x=%02x %02x=%02x %02x=%02x %02x=%02x %02x=%02x"
+@@ -1452,15 +1456,14 @@
+ 		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+ 		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+ 		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
+-		 * 0095: 0094 proved sleep-set votes physically change
+-		 * ldoc2's MODE/ENABLE regs while active-set votes change
+-		 * nothing; Linux (rpmh-regulator.c) sends active values to
+-		 * the WAKE_ONLY state first whenever the sleep set differs,
+-		 * and the wake set is what RPMh applies while awake. Fire
+-		 * SLEEP -> WAKE -> ACTIVE (Linux emission order) for every
+-		 * rail; dump ldoc2 between each state to attribute the
+-		 * register flips, bus-sample ldoa10/ldoc7 (not observer
+-		 * readable) after all three.
++		 * 0096: pm6150 sits at SID0 (DT pm6150@0), so ppid for ldoa10
++		 * is 0x01d — earlier observer probes hardcoded SID4 and never
++		 * tried it. Dump the PM6150 ON reference (l11, enabled 1.8 V
++		 * under Android), the target ldoa10, and the PM6150L
++		 * references (ldoc3 ON / ldoc2 OFF); then fire Linux order
++		 * SLEEP -> WAKE -> ACTIVE on ldoa10 with a dump between each
++		 * state. rh_fire prints RPMh response words, so a rejected
++		 * vote is visible. ldoc7 remains a bus-only test.
+ 		 */
+ 		st.bb = true;
+ 		st.bb_sda = 6;
+@@ -1472,40 +1475,24 @@
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(6)), touch_rd(st.gpio, TOUCH_GPIO_IO(7)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+ 		tcm_pm_mapdump();
+-		tcm_pm_dump("bobc1 pre", 0x04);
++		tcm_pm_dump("bobc1 pre", 4, 0x04);
++		tcm_pm_dump("l11 pre", 0, 0x1e);
++		tcm_pm_dump("ldoa10 pre", 0, 0x1d);
++		tcm_pm_dump("ldoc7 pre", 4, 0x17);
++		tcm_pm_dump("ldoc3 pre", 4, 0x09);
++		tcm_pm_dump("ldoc2 pre", 4, 0x08);
+ 		sweet_rpmh_db_dump();
+-		/*
+-		 * ldoc2 state matrix: pre, +sleep dump, +wake dump,
+-		 * +active dump + CONTROL proof. A register that flips after
+-		 * a given vote attributes the actuation to that set; the
+-		 * off-cycle of 0094 is dropped (active-off provably inert).
+-		 */
+-		uint8_t c0 = 0, vs = 0;
+-		bool rr0 = tcm_pm_read(0x08, 0x04, &c0);
+-		bool rr1 = tcm_pm_read(0x08, 0x40, &vs);
+-		unsigned mv2 = (rr1 && vs) ? (unsigned)vs * 8u : 1200u;
+-		if (mv2 < 1150 || mv2 > 1350) {
+-			mv2 = 1200;
+-		}
+-		tcm_pm_dump("ldoc2 pre", 0x08);
+-		int v2s = sweet_rpmh_vreg_sleep("ldoc2", mv2);
++		int s1 = sweet_rpmh_vreg_sleep("ldoa10", 1800);
+ 		touch_wait(20);
+-		tcm_pm_dump("ldoc2 slp", 0x08);
+-		int v2w = sweet_rpmh_vreg_wake("ldoc2", mv2);
++		tcm_pm_dump("ldoa10 slp", 0, 0x1d);
++		int w1 = sweet_rpmh_vreg_wake("ldoa10", 1800);
+ 		touch_wait(20);
+-		tcm_pm_dump("ldoc2 wke", 0x08);
+-		int v2 = sweet_rpmh_vreg_enable("ldoc2", mv2);
++		tcm_pm_dump("ldoa10 wke", 0, 0x1d);
++		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+ 		touch_wait(20);
+-		uint8_t c1 = 0;
+-		bool rr2 = tcm_pm_read(0x08, 0x04, &c1);
+-		printf("SWEET TOUCH: ldoc2 vote-proof control %#x->%#x vset=%#x mv=%u slp=%d wke=%d act=%d ok=%d%d%d\n",
+-		    c0, c1, vs, mv2, v2s, v2w, v2, (int)rr0, (int)rr1, (int)rr2);
+-		tcm_pm_dump("ldoc2 act", 0x08);
+-		int s1 = sweet_rpmh_vreg_sleep("ldoa10", 1800);
++		tcm_pm_dump("ldoa10 act", 0, 0x1d);
+ 		int s2 = sweet_rpmh_vreg_sleep("ldoc7", 3000);
+-		int w1 = sweet_rpmh_vreg_wake("ldoa10", 1800);
+ 		int w2 = sweet_rpmh_vreg_wake("ldoc7", 3000);
+-		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+ 		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
+ 		touch_wait(500);
+ 		printf("SWEET TOUCH: stage1 rails ldoa10=%d,%d,%d ldoc7=%d,%d,%d (slp,wke,act) bus sda=%#x scl=%#x\n",
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -45,6 +45,7 @@
+ #define RH_ADDR         0x34u
+ #define RH_DATA         0x38u
+ #define RH_CMD_STATUS   0x3cu
++#define RH_RESP         0x40u
+ #define RH_AMC_EN       (1u << 16)
+ #define RH_TRIGGER      (1u << 24)
+ #define RH_ISSUED       (1u << 8)
+@@ -335,8 +336,12 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: %s TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    bank, t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: %s TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x"
++	    " resp=%#x/%#x/%#x\n",
++	    bank, t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2],
++	    rh_read(rh_tcs, b + RH_RESP + 0 * RH_CMD_STRIDE),
++	    rh_read(rh_tcs, b + RH_RESP + 1 * RH_CMD_STRIDE),
++	    rh_read(rh_tcs, b + RH_RESP + 2 * RH_CMD_STRIDE));
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
