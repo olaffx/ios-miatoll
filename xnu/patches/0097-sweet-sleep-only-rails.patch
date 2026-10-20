@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1452,18 +1452,12 @@
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)), miatoll ? "miatoll" : "sweet");
+ 	if (miatoll) {
+ 		/*
+-		 * DT (fragment@35): vdd pm6150_l10 1.8 V, avdd pm6150l_l7 3.0 V,
+-		 * no power GPIO; reset gpio8 active-low 20 ms then 200 ms boot
+-		 * wait; irq gpio9 level-low; bus pins gpio6/7 (function "gpio"
+-		 * = TLMM mux 0, pull-up, 2 mA — the DT sleep state).
+-		 * 0096: pm6150 sits at SID0 (DT pm6150@0), so ppid for ldoa10
+-		 * is 0x01d — earlier observer probes hardcoded SID4 and never
+-		 * tried it. Dump the PM6150 ON reference (l11, enabled 1.8 V
+-		 * under Android), the target ldoa10, and the PM6150L
+-		 * references (ldoc3 ON / ldoc2 OFF); then fire Linux order
+-		 * SLEEP -> WAKE -> ACTIVE on ldoa10 with a dump between each
+-		 * state. rh_fire prints RPMh response words, so a rejected
+-		 * vote is visible. ldoc7 remains a bus-only test.
++		 * 0097: 0096 read the real rail (ldoa10, SID0/0x1d) directly —
++		 * SLEEP vote flips reg00 00->01 (the ON pattern), WAKE flips it
++		 * back and touches reg45, ACTIVE restores pre; the Linux-order
++		 * triple therefore ends exactly where XBL left the rail (off)
++		 * and the clamp never released. Fire SLEEP ONLY so the rail
++		 * ends in the sleep-vote state, then test the bus.
+ 		 */
+ 		st.bb = true;
+ 		st.bb_sda = 6;
+@@ -1476,27 +1470,15 @@
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)));
+ 		tcm_pm_mapdump();
+ 		tcm_pm_dump("bobc1 pre", 4, 0x04);
+-		tcm_pm_dump("l11 pre", 0, 0x1e);
+ 		tcm_pm_dump("ldoa10 pre", 0, 0x1d);
+-		tcm_pm_dump("ldoc7 pre", 4, 0x17);
+-		tcm_pm_dump("ldoc3 pre", 4, 0x09);
+-		tcm_pm_dump("ldoc2 pre", 4, 0x08);
+ 		sweet_rpmh_db_dump();
+ 		int s1 = sweet_rpmh_vreg_sleep("ldoa10", 1800);
+ 		touch_wait(20);
+ 		tcm_pm_dump("ldoa10 slp", 0, 0x1d);
+-		int w1 = sweet_rpmh_vreg_wake("ldoa10", 1800);
+-		touch_wait(20);
+-		tcm_pm_dump("ldoa10 wke", 0, 0x1d);
+-		int p1 = sweet_rpmh_vreg_enable("ldoa10", 1800);
+-		touch_wait(20);
+-		tcm_pm_dump("ldoa10 act", 0, 0x1d);
+ 		int s2 = sweet_rpmh_vreg_sleep("ldoc7", 3000);
+-		int w2 = sweet_rpmh_vreg_wake("ldoc7", 3000);
+-		int p2 = sweet_rpmh_vreg_enable("ldoc7", 3000);
+ 		touch_wait(500);
+-		printf("SWEET TOUCH: stage1 rails ldoa10=%d,%d,%d ldoc7=%d,%d,%d (slp,wke,act) bus sda=%#x scl=%#x\n",
+-		    s1, w1, p1, s2, w2, p2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
++		printf("SWEET TOUCH: stage1 rails ldoa10=%d ldoc7=%d (slp only) bus sda=%#x scl=%#x\n",
++		    s1, s2, touch_rd(st.gpio, TOUCH_GPIO_IO(6)),
+ 		    touch_rd(st.gpio, TOUCH_GPIO_IO(7)));
+ 		touch_gpio_mi(9, 0, 3, 3, false, false); /* IRQ input, 8 mA, pull-up */
+ 		touch_gpio_mi(8, 0, 3, 3, true, false);  /* reset held low */
