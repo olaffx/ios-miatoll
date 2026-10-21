@@ -1,0 +1,282 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index aee5a6c..69688f5 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -23,6 +23,24 @@
+ #include <libkern/crc.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/mbuf.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/if_dl.h>
++#include <net/if_media.h>
++#include <net/if_private.h>
++#include <net/if_ether.h>
++#include <net/ethernet.h>
++#include <net/kpi_interface.h>
++#include <libkern/copyio.h>
++/* no __BEGIN_DECLS in these: force C linkage, the implementations are C files */
++extern "C" {
++#include <sys/kern_event.h>
++#include <net/net_kev.h>
++#include <net/bpf.h>
++}
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -5067,6 +5085,234 @@ topaz_wlan_joined(void)
+ 	return s_state == S_UP;
+ }
+ 
++/* ---------------- en0: the radio as a BSD Ethernet interface
++ *
++ * The join/scan/transmit API above was written for "the rest of the kernel" but
++ * nothing ever called it (also true in ios-topaz): iOS never saw an en0, so no
++ * DHCP, no routing, no wifi.  This is that missing consumer:
++ *   - autojoin from boot-args wifi_ssid= / wifi_pass= (empty pass = open net)
++ *   - publish en0 when the link comes up (topaz_wlan_link_hook from w_join_end)
++ *   - frames out via wl_output -> topaz_wlan_transmit, in via topaz_wlan_rx_hook
++ *   - configd does DHCP over BPF like on any Ethernet device (bpfattach).
++ */
++
++static ifnet_t wl_ifp;
++static bool wl_if_created;
++static char wl_ssid[33];
++static char wl_pass[64];
++static volatile bool wl_up;
++
++static errno_t
++wl_output(__unused ifnet_t ifp, mbuf_t m)
++{
++	uint8_t buf[1514];                      /* mbuf_t is __mbuf *, these take struct mbuf * */
++	struct mbuf *mb = (struct mbuf *)m;
++	u_int32_t len = (u_int32_t)mbuf_pkthdr_len(m);
++	if (len < 14 || len > sizeof(buf)) {
++		m_freem(mb);
++		return EMSGSIZE;
++	}
++	m_copydata(mb, 0, len, buf);
++	m_freem(mb);
++	return topaz_wlan_transmit(buf, len) ? 0 : ENETDOWN;
++}
++
++static errno_t
++wl_ioctl(ifnet_t ifp, u_long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:                    /* feth: configd's way of bringing it up */
++		(void)ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:                   /* dlil notifies with data == NULL */
++		return 0;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t ulist = (cmd == SIOCGIFMEDIA64)
++		    ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist
++		    : CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int word = IFM_MAKEWORD(IFM_ETHER, IFM_AUTO, 0, 0);
++		ifmr->ifm_current = word;
++		ifmr->ifm_active = word;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = wl_up ? (IFM_AVALID | IFM_ACTIVE) : IFM_AVALID;
++		ifmr->ifm_count = 1;
++		if (ulist != USER_ADDR_NULL) {
++			return copyout(&word, ulist, sizeof(word));
++		}
++		return 0;
++	}
++	default:
++		return 0;
++	}
++}
++
++static void
++wl_detached(__unused ifnet_t ifp)
++{
++	wl_ifp = NULL;
++	wl_up = false;
++}
++
++/* feth's interface_link_event, q.v. if_fake.c */
++static void
++wl_event(u_int32_t event_code)
++{
++	struct wl_ev {
++		u_int32_t ifnet_family;
++		u_int32_t unit;
++		char if_name[IFNAMSIZ];
++	};
++	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct wl_ev)] = { 0 };
++	struct kern_event_msg *header = (struct kern_event_msg *)message;
++	struct wl_ev *ev = (struct wl_ev *)(header + 1);
++
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = event_code;
++	ev->ifnet_family = ifnet_family(wl_ifp);
++	ev->unit = (u_int32_t)ifnet_unit(wl_ifp);
++	memcpy(ev->if_name, ifnet_name(wl_ifp), strlen(ifnet_name(wl_ifp)) + 1);
++	(void)ifnet_event(wl_ifp, header);
++}
++
++static void
++wl_create(void)
++{
++	struct ifnet_init_eparams init = {};
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_NX_NOAUTO;
++	init.uniqueid = "sweetwl";
++	init.uniqueid_len = sizeof("sweetwl") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = wl_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = wl_ioctl;
++	init.detach = wl_detached;
++	static const uint8_t wl_bcast[ETHER_ADDR_LEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	init.broadcast_addr = wl_bcast;
++	init.broadcast_len = ETHER_ADDR_LEN;
++
++	ifnet_t ifp = NULL;
++	int err = ifnet_allocate_extended(&init, &ifp);
++	if (err != 0) {
++		LOG("wifi: en0 allocate failed %d", err);
++		return;
++	}
++	(void)ifnet_set_capabilities_enabled(ifp, 0, -1);
++	(void)ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	(void)ifnet_set_baudrate(ifp, 0);
++	(void)ifnet_set_mtu(ifp, ETHERMTU);
++	(void)ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	(void)ifnet_set_hdrlen(ifp, (u_int16_t)sizeof(struct ether_header));
++	(void)ifnet_set_offload(ifp, 0);
++	err = ifnet_attach(ifp, NULL);
++	if (err != 0) {
++		LOG("wifi: en0 attach failed %d", err);
++		ifnet_release(ifp);
++		return;
++	}
++	wl_ifp = ifp;
++	uint8_t mac[6];
++	topaz_wlan_address(mac);
++	(void)ifnet_set_lladdr(ifp, mac, sizeof(mac));
++	bpfattach(ifp, DLT_EN10MB, (u_int)sizeof(struct ether_header));
++	LOG("wifi: en0 created, mac %02x:%02x:%02x:%02x:%02x:%02x",
++	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
++static void
++wl_rx(const uint8_t *frame, size_t length)
++{
++	ifnet_t ifp = wl_ifp;
++	if (ifp == NULL || length < 14 || length > 1514) {
++		return;
++	}
++	mbuf_t m = NULL;
++	if (mbuf_allocpacket(MBUF_DONTWAIT, length, NULL, &m) != 0 || m == NULL) {
++		return;
++	}
++	m_copyback((struct mbuf *)m, 0, (int)length, (void *)frame);
++	struct ifnet_stat_increment_param st = {};
++	st.packets_in = 1;
++	st.bytes_in = (u_int32_t)length;
++	(void)ifnet_input(ifp, m, &st);
++}
++
++static void
++wl_link(bool up)
++{
++	if (up) {
++		if (!wl_if_created) {
++			wl_create();
++			wl_if_created = wl_ifp != NULL;
++		}
++		if (wl_ifp != NULL && !wl_up) {
++			wl_up = true;
++			(void)ifnet_set_flags(wl_ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++			wl_event(KEV_DL_LINK_ON);
++			LOG("wifi: en0 link up");
++		}
++	} else if (wl_ifp != NULL && wl_up) {
++		wl_up = false;
++		wl_event(KEV_DL_LINK_OFF);
++		(void)ifnet_set_flags(wl_ifp, 0, IFF_UP | IFF_RUNNING);
++		LOG("wifi: en0 link down");
++	}
++}
++
++/* the autojoin thread: hear the SSID first (join returns ENOENT otherwise), then join */
++static void
++wl_thread(__unused void *param, __unused wait_result_t wr)
++{
++	while (!topaz_wlan_ready()) {
++		IOSleep(250);
++	}
++	LOG("wifi: radio ready, autojoin '%s'", wl_ssid);
++	for (;;) {
++		bool found = false;
++		struct topaz_wlan_bss b;
++		for (unsigned i = 0; topaz_wlan_heard(i, &b); i++) {
++			if (b.ssid_length == strlen(wl_ssid) &&
++			    memcmp(b.ssid, wl_ssid, b.ssid_length) == 0) {
++				found = true;
++				break;
++			}
++		}
++		if (!found) {
++			LOG("wifi: scan for '%s'", wl_ssid);
++			(void)topaz_wlan_scan();
++			IOSleep(1000);
++			continue;
++		}
++		LOG("wifi: join '%s'", wl_ssid);
++		int r = topaz_wlan_join((const uint8_t *)wl_ssid, (unsigned)strlen(wl_ssid), NULL,
++		    wl_pass[0] != '\0' ? (const uint8_t *)wl_pass : NULL, (unsigned)strlen(wl_pass));
++		if (r == 0) {
++			while (topaz_wlan_joined()) {
++				IOSleep(1000);
++			}
++			LOG("wifi: link lost");
++			IOSleep(3000);
++		} else {
++			LOG("wifi: join failed %d", r);
++			IOSleep(5000);
++		}
++	}
++	thread_terminate(current_thread());
++}
++
+ /* frames from the network stack wait here for the modem thread */
+ #define ETXQ 32
+ static struct { uint16_t len; uint8_t d[1514]; } etxq[ETXQ];
+@@ -5578,6 +5824,17 @@ topaz_modem_init(void)
+ 		return;
+ 	}
+ 	started = true;
++	if (wifi_enabled() && PE_parse_boot_argn("wifi_ssid", wl_ssid, sizeof(wl_ssid)) &&
++	    wl_ssid[0] != '\0') {
++		(void)PE_parse_boot_argn("wifi_pass", wl_pass, sizeof(wl_pass));
++		topaz_wlan_rx_hook = wl_rx;
++		topaz_wlan_link_hook = wl_link;
++		thread_t wlth;
++		if (kernel_thread_start(wl_thread, NULL, &wlth) == KERN_SUCCESS) {
++			thread_deallocate(wlth);
++		}
++		LOG("wifi: autojoin '%s' (%s)", wl_ssid, wl_pass[0] != '\0' ? "passphrase set" : "open");
++	}
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
