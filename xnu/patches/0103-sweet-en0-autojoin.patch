@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index aee5a6c..69688f5 100644
+index aee5a6c..7abae8a 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -23,6 +23,24 @@
@@ -27,7 +27,7 @@ index aee5a6c..69688f5 100644
  
  extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
-@@ -5067,6 +5085,234 @@ topaz_wlan_joined(void)
+@@ -5067,6 +5085,235 @@ topaz_wlan_joined(void)
  	return s_state == S_UP;
  }
  
@@ -110,7 +110,8 @@ index aee5a6c..69688f5 100644
 +		u_int32_t unit;
 +		char if_name[IFNAMSIZ];
 +	};
-+	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct wl_ev)] = { 0 };
++	char message[sizeof(struct kern_event_msg) + sizeof(struct wl_ev)]
++	    __attribute__((aligned(__alignof__(struct kern_event_msg)))) = { 0 };
 +	struct kern_event_msg *header = (struct kern_event_msg *)message;
 +	struct wl_ev *ev = (struct wl_ev *)(header + 1);
 +
@@ -262,7 +263,7 @@ index aee5a6c..69688f5 100644
  /* frames from the network stack wait here for the modem thread */
  #define ETXQ 32
  static struct { uint16_t len; uint8_t d[1514]; } etxq[ETXQ];
-@@ -5578,6 +5824,17 @@ topaz_modem_init(void)
+@@ -5578,6 +5825,17 @@ topaz_modem_init(void)
  		return;
  	}
  	started = true;
