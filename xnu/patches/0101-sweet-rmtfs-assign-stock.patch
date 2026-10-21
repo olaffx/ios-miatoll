@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 1e426ca..aee5a6c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -2153,7 +2153,7 @@ tftp_session(uint32_t dst_port, const uint8_t *d, uint32_t len)
+ }
+ 
+ /* rmtfs */
+-#define RMTFS_BUF_SIZE      0x300000            /* qcom,rmtfs_sharedmem size */
++#define RMTFS_BUF_SIZE      0x200000            /* stock qcom,rmtfs_sharedmem: 2 MiB */
+ #define VMID_HLOS           3
+ #define VMID_MSS_MSA        15
+ #define VMID_NAV            0x2B
+@@ -2274,12 +2274,15 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 	}
+ 	case 4: {                                   /* ALLOC_BUFF */
+ 		if (rmtfs_pa == 0) {
++			while ((MODEM_POOL_BASE + pool_used) & 0x1fffffull) {
++				pool_used += 0x1000;       /* stock: dma_alloc_coherent(2 MiB) is 2 MiB aligned */
++			}
+ 			rmtfs_va = (uint8_t *)pool_alloc(RMTFS_BUF_SIZE, &rmtfs_pa);   /* the modem owns it from now on */
+ 			if (rmtfs_va == NULL) {
+ 				rmtfs_pa = 0;
+ 			} else {
+-				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA, VMID_NAV };
+-				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 3);
++				static const uint32_t v[] = { VMID_HLOS, VMID_MSS_MSA };  /* stock setup_shared_ram_perms() */
++				(void)scm_assign(rmtfs_pa, RMTFS_BUF_SIZE, v, 2);
+ 			}
+ 		}
+ 		LOG("t=%u ms: rmtfs: alloc for caller %u -> %llx", g_ms, caller, rmtfs_pa);
